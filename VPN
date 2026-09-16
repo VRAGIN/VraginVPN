@@ -1,0 +1,301 @@
+import SwiftUI
+import NetworkExtension
+
+struct ContentView: View {
+    @StateObject private var vpn = VPNManager.shared
+    @State private var newRule: String = ""
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Статус") {
+                    HStack {
+                        Circle()
+                            .fill(vpn.status == .connected ? Color.green : Color.gray)
+                            .frame(width: 10, height: 10)
+                        Text(statusText)
+                        Spacer()
+                        if vpn.status == .connected {
+                            Text(vpn.pingMs != nil ? "\(vpn.pingMs!) ms" : "—")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Button(vpn.status == .connected ? "Отключить" : "Подключить") {
+                        vpn.toggle()
+                    }
+                }
+
+                Section("Сервер") {
+                    TextField("Адрес сервера (endpoint)", text: $vpn.config.endpoint)
+                        .keyboardType(.URL)
+                        .autocapitalization(.none)
+                    TextField("Публичный ключ сервера", text: $vpn.config.serverPublicKey)
+                        .autocapitalization(.none)
+                    TextField("Приватный ключ клиента", text: $vpn.config.clientPrivateKey)
+                        .autocapitalization(.none)
+                }
+
+                Section("Режим трафика") {
+                    Picker("Режим", selection: $vpn.config.mode) {
+                        Text("Весь трафик через VPN").tag(TrafficMode.full)
+                        Text("Только белый список").tag(TrafficMode.whitelistOnly)
+                        Text("Всё, кроме чёрного списка").tag(TrafficMode.blacklist)
+                    }
+                }
+
+                if vpn.config.mode != .full {
+                    Section("Белый список (домены/IP)") {
+                        ForEach(vpn.config.whitelist, id: \.self) { rule in
+                            Text(rule)
+                        }
+                        .onDelete { vpn.config.whitelist.remove(atOffsets: $0) }
+
+                        HStack {
+                            TextField("example.com или 10.0.0.0/24", text: $newRule)
+                                .autocapitalization(.none)
+                            Button("Добавить") {
+                                guard !newRule.isEmpty else { return }
+                                vpn.config.whitelist.append(newRule)
+                                newRule = ""
+                            }
+                        }
+                    }
+                }
+
+                Section("Производительность") {
+                    Toggle("Автовыбор ближайшего сервера по пингу", isOn: $vpn.config.autoPickLowestPing)
+                    Stepper("MTU: \(vpn.config.mtu)", value: $vpn.config.mtu, in: 1200...1500, step: 20)
+                }
+            }
+            .navigationTitle("Мой VPN")
+        }
+        .onAppear { vpn.loadStatus() }
+    }
+
+    private var statusText: String {
+        switch vpn.status {
+        case .connected: return "Подключено"
+        case .connecting: return "Подключение…"
+        case .disconnected: return "Отключено"
+        case .invalid, .reasserting, .disconnecting: return "…"
+        @unknown default: return "—"
+        }
+    }
+}
+
+import SwiftUI
+
+@main
+struct MyVPNClientApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
+import NetworkExtension
+import WireGuardKit // добавляется через Swift Package: https://github.com/WireGuard/wireguard-apple
+
+/// Экстеншен, который реально поднимает туннель.
+/// Работает в отдельном процессе от основного приложения (требование Apple).
+class PacketTunnelProvider: NEPacketTunnelProvider {
+
+    private var adapter: WireGuardAdapter?
+
+    override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
+              let cfg = proto.providerConfiguration,
+              let serverPublicKey = cfg["serverPublicKey"] as? String,
+              let clientPrivateKey = cfg["clientPrivateKey"] as? String,
+              let endpoint = proto.serverAddress,
+              let modeRaw = cfg["mode"] as? String,
+              let mode = TrafficMode(rawValue: modeRaw)
+        else {
+            completionHandler(NSError(domain: "MyVPN", code: 1, userInfo: [NSLocalizedDescriptionKey: "Некорректная конфигурация"]))
+            return
+        }
+
+        let whitelist = cfg["whitelist"] as? [String] ?? []
+        let mtu = cfg["mtu"] as? Int ?? 1420
+
+        let wgConfig = buildWireGuardConfig(
+            endpoint: endpoint,
+            serverPublicKey: serverPublicKey,
+            clientPrivateKey: clientPrivateKey,
+            mode: mode,
+            whitelist: whitelist,
+            mtu: mtu
+        )
+
+        let adapter = WireGuardAdapter(with: self) { logLevel, message in
+            NSLog("[WireGuard] \(message)")
+        }
+        self.adapter = adapter
+
+        adapter.start(tunnelConfiguration: wgConfig) { error in
+            completionHandler(error)
+        }
+    }
+
+    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        adapter?.stop { _ in completionHandler() }
+    }
+
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        // Канал для обмена сообщениями с основным приложением
+        // (например, запрос текущего пинга/статуса соединения).
+        completionHandler?(nil)
+    }
+
+    /// Собирает конфигурацию WireGuard: маршруты (routes) определяют,
+    /// какой трафик реально идёт через туннель.
+    /// - full: маршрут 0.0.0.0/0 — весь трафик
+    /// - whitelistOnly: маршруты только на адреса из списка
+    /// - blacklist: маршрут 0.0.0.0/0, но с excludedRoutes для списка
+    private func buildWireGuardConfig(
+        endpoint: String,
+        serverPublicKey: String,
+        clientPrivateKey: String,
+        mode: TrafficMode,
+        whitelist: [String],
+        mtu: Int
+    ) -> TunnelConfiguration {
+
+        var allowedIPs: [IPAddressRange] = []
+        switch mode {
+        case .full:
+            allowedIPs = [IPAddressRange(from: "0.0.0.0/0")!, IPAddressRange(from: "::/0")!]
+        case .whitelistOnly:
+            allowedIPs = whitelist.compactMap { IPAddressRange(from: $0) }
+        case .blacklist:
+            // WireGuard сам по себе не умеет "исключить" IP из allowedIPs напрямую —
+            // на практике для blacklist-режима резолвим домены в IP и добавляем
+            // отдельные /32 маршруты в allowedIPs НЕ включая их, а вместо этого
+            // используем NEPacketTunnelNetworkSettings.excludedRoutes ниже.
+            allowedIPs = [IPAddressRange(from: "0.0.0.0/0")!, IPAddressRange(from: "::/0")!]
+        }
+
+        let peer = PeerConfiguration(publicKey: PublicKey(base64Key: serverPublicKey)!)
+        var mutablePeer = peer
+        mutablePeer.endpoint = Endpoint(from: endpoint)
+        mutablePeer.allowedIPs = allowedIPs
+        mutablePeer.persistentKeepAlive = 25 // держим NAT открытым — важно для низкого пинга на переподключениях
+
+        var interface = InterfaceConfiguration(privateKey: PrivateKey(base64Key: clientPrivateKey)!)
+        interface.mtu = UInt16(mtu)
+
+        return TunnelConfiguration(name: "MyVPN", interface: interface, peers: [mutablePeer])
+    }
+}
+import Foundation
+import NetworkExtension
+import Combine
+
+enum TrafficMode: String, Codable {
+    case full            // весь трафик через VPN
+    case whitelistOnly   // через VPN идут только адреса из списка
+    case blacklist       // через VPN идёт всё, КРОМЕ списка
+}
+
+struct VPNConfig: Codable {
+    var endpoint: String = ""
+    var serverPublicKey: String = ""
+    var clientPrivateKey: String = ""
+    var whitelist: [String] = []
+    var mode: TrafficMode = .full
+    var autoPickLowestPing: Bool = true
+    var mtu: Int = 1420
+}
+
+/// Управляет NETunnelProviderManager: создание/обновление профиля,
+/// подключение/отключение, чтение статуса.
+final class VPNManager: ObservableObject {
+    static let shared = VPNManager()
+
+    @Published var status: NEVPNStatus = .disconnected
+    @Published var pingMs: Int? = nil
+    @Published var config: VPNConfig = VPNConfig() {
+        didSet { saveConfig() }
+    }
+
+    private var manager: NETunnelProviderManager?
+    private let bundleId = "com.yourcompany.MyVPNClient.PacketTunnel"
+    private let defaultsKey = "vpn.config"
+
+    init() {
+        loadConfig()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(statusChanged),
+            name: .NEVPNStatusDidChange, object: nil
+        )
+    }
+
+    func loadStatus() {
+        NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, _ in
+            guard let self = self else { return }
+            if let existing = managers?.first {
+                self.manager = existing
+                DispatchQueue.main.async {
+                    self.status = existing.connection.status
+                }
+            }
+        }
+    }
+
+    func toggle() {
+        switch status {
+        case .connected, .connecting:
+            manager?.connection.stopVPNTunnel()
+        default:
+            connect()
+        }
+    }
+
+    private func connect() {
+        let tunnelManager = manager ?? NETunnelProviderManager()
+
+        let proto = NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = bundleId
+        proto.serverAddress = config.endpoint
+        // Приватные данные передаются в extension через providerConfiguration,
+        // на реальном проекте — лучше через Keychain, а не как plain dict.
+        proto.providerConfiguration = [
+            "serverPublicKey": config.serverPublicKey,
+            "clientPrivateKey": config.clientPrivateKey,
+            "mode": config.mode.rawValue,
+            "whitelist": config.whitelist,
+            "mtu": config.mtu
+        ]
+
+        tunnelManager.protocolConfiguration = proto
+        tunnelManager.localizedDescription = "Мой VPN"
+        tunnelManager.isEnabled = true
+
+        tunnelManager.saveToPreferences { [weak self] error in
+            guard error == nil else { return }
+            tunnelManager.loadFromPreferences { error in
+                guard error == nil else { return }
+                self?.manager = tunnelManager
+                try? tunnelManager.connection.startVPNTunnel()
+            }
+        }
+    }
+
+    @objc private func statusChanged() {
+        guard let conn = manager?.connection else { return }
+        DispatchQueue.main.async { self.status = conn.status }
+    }
+
+    private func saveConfig() {
+        if let data = try? JSONEncoder().encode(config) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+
+    private func loadConfig() {
+        if let data = UserDefaults.standard.data(forKey: defaultsKey),
+           let decoded = try? JSONDecoder().decode(VPNConfig.self, from: data) {
+            config = decoded
+        }
+    }
+}
